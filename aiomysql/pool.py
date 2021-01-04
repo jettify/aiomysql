@@ -5,9 +5,12 @@ import asyncio
 import collections
 import warnings
 
+from pymysql import OperationalError
+
+from .log import logger
 from .connection import connect
 from .utils import (_PoolContextManager, _PoolConnectionContextManager,
-                    _PoolAcquireContextManager)
+                    _PoolAcquireContextManager, TaskTransactionContextManager)
 
 
 def create_pool(minsize=1, maxsize=10, echo=False, pool_recycle=-1,
@@ -50,6 +53,7 @@ class Pool(asyncio.AbstractServer):
         self._closed = False
         self._echo = echo
         self._recycle = pool_recycle
+        self._db = kwargs.get('db')
 
     @property
     def echo(self):
@@ -70,6 +74,10 @@ class Pool(asyncio.AbstractServer):
     @property
     def freesize(self):
         return len(self._free)
+
+    @property
+    def db_name(self):
+        return self._db
 
     async def clear(self):
         """Close all free connections in pool."""
@@ -124,8 +132,21 @@ class Pool(asyncio.AbstractServer):
 
     def acquire(self):
         """Acquire free connection from the pool."""
+        o_transaction_context_manager = TaskTransactionContextManager.get_transaction_context_manager(asyncio.Task.current_task())
+        if o_transaction_context_manager:
+            return o_transaction_context_manager
+
         coro = self._acquire()
         return _PoolAcquireContextManager(coro, self)
+
+    def acquire_with_transaction(self):
+        """Acquire free connection from the pool for transaction"""
+        o_transaction_context_manager = TaskTransactionContextManager.get_transaction_context_manager(asyncio.Task.current_task())
+        if o_transaction_context_manager:
+            return o_transaction_context_manager
+
+        coro = self._acquire()
+        return TaskTransactionContextManager(coro, self)
 
     async def _acquire(self):
         if self._closing:
@@ -135,11 +156,12 @@ class Pool(asyncio.AbstractServer):
                 await self._fill_free_pool(True)
                 if self._free:
                     conn = self._free.popleft()
-                    assert not conn.closed, conn
-                    assert conn not in self._used, (conn, self._used)
+                    # assert not conn.closed, conn
+                    # assert conn not in self._used, (conn, self._used)
                     self._used.add(conn)
                     return conn
                 else:
+                    logger.debug('%s - All connections (%d) are busy. Waiting for release connection', self._db, self.freesize)
                     await self._cond.wait()
 
     async def _fill_free_pool(self, override_min):
@@ -149,41 +171,60 @@ class Pool(asyncio.AbstractServer):
         while n < free_size:
             conn = self._free[-1]
             if conn._reader.at_eof() or conn._reader.exception():
+                logger.debug('%s - Connection (%d) is removed from pool because of at_eof or exception', self._db, id(conn))
                 self._free.pop()
                 conn.close()
 
-            elif (self._recycle > -1 and
-                  self._loop.time() - conn.last_usage > self._recycle):
+            elif self._recycle > -1 and self._loop.time() - conn.last_usage > self._recycle:
+                logger.debug('%s - Connection (%d) is removed from pool because of recycle time %d', self._db, id(conn), self._recycle)
                 self._free.pop()
                 conn.close()
 
             else:
                 self._free.rotate()
+
             n += 1
 
         while self.size < self.minsize:
-            self._acquiring += 1
-            try:
-                conn = await connect(echo=self._echo, loop=self._loop,
-                                     **self._conn_kwargs)
-                # raise exception if pool is closing
-                self._free.append(conn)
-                self._cond.notify()
-            finally:
-                self._acquiring -= 1
+            await self.__create_new_connection()
+
         if self._free:
             return
 
         if override_min and self.size < self.maxsize:
-            self._acquiring += 1
+            await self.__create_new_connection()
+
+    async def __create_new_connection(self):
+        logger.debug('%s - Try to create new connection', self._db)
+        self._acquiring += 1
+        try:
             try:
-                conn = await connect(echo=self._echo, loop=self._loop,
-                                     **self._conn_kwargs)
-                # raise exception if pool is closing
-                self._free.append(conn)
-                self._cond.notify()
-            finally:
-                self._acquiring -= 1
+                conn = await connect(echo=self._echo, loop=self._loop, **self._conn_kwargs)
+
+            except OperationalError as error:
+                logger.error(error)
+                sleep_time_list = [3] * 20
+                for attempt, sleep_time in enumerate(sleep_time_list):
+                    try:
+                        logger.warning('%s - Connect to MySQL failed. Attempt %d of 20', self._db, attempt + 1)
+                        conn = await connect(echo=self._echo, loop=self._loop, **self._conn_kwargs)
+                        logger.info('%s - Successfully connect to MySQL after error', self._db)
+                        break
+
+                    except OperationalError as e:
+                        logger.error(e)
+                        await asyncio.sleep(sleep_time)
+
+                else:
+                    logger.error('%s - Connect to MySQL failed', self._db)
+                    raise error
+
+            # raise exception if pool is closing
+            self._free.append(conn)
+            self._cond.notify()
+
+        finally:
+            self._acquiring -= 1
 
     async def _wakeup(self):
         async with self._cond:
@@ -198,10 +239,10 @@ class Pool(asyncio.AbstractServer):
         fut.set_result(None)
 
         if conn in self._terminated:
-            assert conn.closed, conn
+            # assert conn.closed, conn
             self._terminated.remove(conn)
             return fut
-        assert conn in self._used, (conn, self._used)
+        # assert conn in self._used, (conn, self._used)
         self._used.remove(conn)
         if not conn.closed:
             in_trans = conn.get_transaction_status()
